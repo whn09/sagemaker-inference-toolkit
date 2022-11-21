@@ -121,13 +121,49 @@ class Transformer(object):
             properties = context.system_properties
             model_dir = properties.get("model_dir")
             self.validate_and_initialize(model_dir=model_dir, context=context)
-
-            response_list = []
+            
+            batch_input = []
+            errors = {}
 
             for i in range(len(data)):
                 input_data = data[i].get("body")
 
-                request_processor = context.request_processor[0]
+                request_processor = context.request_processor[i]
+
+                request_property = request_processor.get_request_properties()
+                content_type = utils.retrieve_content_type_header(request_property)
+
+                if content_type in content_types.UTF8_TYPES:
+                    input_data = input_data.decode("utf-8")
+                try:
+                    batch_input.append(
+                        self._run_handler_function(
+                            self._input_fn, *(input_data, content_type)
+                        )
+                    )
+                except Exception as data_input_exception:
+                    trace = traceback.format_exc()
+                    if not isinstance(data_input_exception, BaseInferenceToolkitError):
+                        data_input_exception = GenericInferenceToolkitError(
+                            http_client.INTERNAL_SERVER_ERROR, str(data_input_exception)
+                        )
+
+                    errors[i] = {
+                        'Code': data_input_exception.status_code,
+                        'Phrase': utils.remove_crlf(data_input_exception.phrase),
+                        'Message': "{}\n{}".format(data_input_exception.message, trace)
+                    }
+            print(f'Data send to predict: data {len(batch_input)}, error {len(errors)}')
+
+            predictions = self._run_handler_function(
+                self._predict_fn, *(batch_input, self._model)
+            )
+
+            response_list = []
+            result_idx = 0
+
+            for i in range(len(data)):
+                request_processor = context.request_processor[i]
 
                 request_property = request_processor.get_request_properties()
                 content_type = utils.retrieve_content_type_header(request_property)
@@ -136,22 +172,22 @@ class Transformer(object):
                 if not accept or accept == content_types.ANY:
                     accept = self._environment.default_accept
 
-                if content_type in content_types.UTF8_TYPES:
-                    input_data = input_data.decode("utf-8")
-
-                result = self._run_handler_function(
-                    self._transform_fn, *(self._model, input_data, content_type, accept)
+                if i in errors:
+                    result = errors[i]
+                else:
+                    result = predictions[result_idx]
+                    result_idx += 1
+                response = self._run_handler_function(
+                    self._output_fn, *(result, accept)
                 )
-
-                response = result
                 response_content_type = accept
 
-                if isinstance(result, tuple):
-                    # handles tuple for backwards compatibility
-                    response = result[0]
-                    response_content_type = result[1]
+                # if isinstance(result, tuple):
+                #     # handles tuple for backwards compatibility
+                #     response = result[0]
+                #     response_content_type = result[1]
 
-                context.set_response_content_type(0, response_content_type)
+                context.set_response_content_type(i, response_content_type)
 
                 response_list.append(response)
 
